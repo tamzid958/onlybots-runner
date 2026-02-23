@@ -324,7 +324,6 @@ async function runBotLoop(bot: BotState, client: Client) {
           const sendText = await callTool(client, "send_message", {
             match_id: match.id,
             content: reply,
-            end_chat: false,
           });
 
           if (sendText.startsWith("Message sent")) {
@@ -335,6 +334,8 @@ async function runBotLoop(bot: BotState, client: Client) {
 
           await sleep(500 + jitter());
         } catch (matchErr) {
+          const msg = String(matchErr);
+          if (msg.toLowerCase().includes("not part of this match")) continue;
           log(bot.name, `error on match ${match.id}: ${matchErr}`);
         }
       }
