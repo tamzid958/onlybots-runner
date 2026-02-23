@@ -191,53 +191,12 @@ function buildPersonality(botName: string): string {
   return `${botName} is playful, romantic, and confident. Keep things warm and fun.`;
 }
 
-function fallbackDeployName(profileName: string): string {
-  const base = profileName
+function configKeyToDeployName(key: string): string {
+  return key
     .replace(/[_-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .split(" ")
-    .filter(Boolean)
-    .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
-    .join(" ");
-  const fallback = base || "Bot";
-  const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
-  return `${fallback} ${suffix}`;
-}
-
-function normalizeDeployName(name: string, profileName: string): string {
-  const cleaned = name
-    .replace(/[^a-zA-Z0-9 ]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!cleaned) return fallbackDeployName(profileName);
-  return cleaned.slice(0, 28);
-}
-
-async function buildDeployName(profileName: string): Promise<string> {
-  const prompt =
-    `Create one unique cyber-style bot name for profile key "${profileName}".\n` +
-    `Return JSON only: {"name":"..."}\n` +
-    `Rules: 1-2 words only, short and memorable, cyber/futuristic vibe.\n` +
-    `Examples of style: "Nova", "Hex", "Vex Zero".\n` +
-    `Use letters/numbers/spaces only, no emojis, max 18 chars.`;
-
-  try {
-    const raw = await chatWithFallback(OLLAMA_MODELS[0], [{ role: "user", content: prompt }]);
-    const cleaned = raw.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "");
-    try {
-      const parsed = JSON.parse(cleaned) as { name?: string };
-      if (typeof parsed?.name === "string") {
-        return normalizeDeployName(parsed.name, profileName);
-      }
-    } catch {
-      // fall through to plain text parse
-    }
-    const firstLine = cleaned.split("\n")[0] ?? "";
-    return normalizeDeployName(firstLine.replace(/^name\s*:\s*/i, ""), profileName);
-  } catch {
-    return fallbackDeployName(profileName);
-  }
+    .slice(0, 28) || "Bot";
 }
 
 function parseApiKeyFromDeployOutput(text: string): string {
@@ -264,7 +223,7 @@ function parseApiKeyFromDeployOutput(text: string): string {
 async function deployBotAndGetApiKey(name: string, entry: McpServerEntry): Promise<string> {
   const client = await makeMcpClient(entry);
   try {
-    const deployName = await buildDeployName(name);
+    const deployName = configKeyToDeployName(name);
     const text = await callTool(client, "deploy_bot", {
       name: deployName,
       personality: buildPersonality(name),
@@ -434,7 +393,7 @@ async function runBotLoop(bot: BotState, client: Client, ownBotNames: Set<string
           if (messages.length > 0) matchActivity.set(match.id, Date.now());
 
           const lastMsg = messages[messages.length - 1];
-          const isMyTurn = messages.length === 0 || lastMsg.botName !== bot.name;
+          const isMyTurn = messages.length === 0 || lastMsg.botName === otherBotName;
           if (!isMyTurn) continue;
 
           const reply = await generateReply(bot, otherBotName || "them", messages);
