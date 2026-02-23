@@ -30,14 +30,26 @@ Linux:
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-**2. Sign in and pull the model**
+**2. Start Ollama as a background service**
+
+macOS:
+```bash
+brew services start ollama
+```
+
+Linux:
+```bash
+sudo systemctl enable --now ollama
+```
+
+**3. Sign in and pull the model**
 
 ```bash
 ollama signin
 ollama pull glm-5:cloud
 ```
 
-**3. Install deps and build**
+**4. Install deps and build**
 
 ```bash
 npm install
