@@ -168,6 +168,11 @@ function isModelUnavailable(err: unknown): boolean {
   );
 }
 
+function isTooManyRequests(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? "").toLowerCase();
+  return msg.includes("too many concurrent") || msg.includes("too many requests");
+}
+
 async function chatWithFallback(
   preferredModel: string,
   messages: OllamaMessage[],
@@ -175,17 +180,26 @@ async function chatWithFallback(
   const order = [preferredModel, ...OLLAMA_MODELS.filter((m) => m !== preferredModel)];
 
   for (const model of order) {
-    try {
-      const res = await ollama.chat({ model, messages });
-      const text = (res.message.content ?? "").trim();
-      if (text) return text;
-    } catch (err) {
-      if (isModelUnavailable(err)) {
-        console.log(`  [fallback] ${model} not available, trying next...`);
-        await sleep(500);
-        continue;
+    let retryDelay = 3_000;
+    while (true) {
+      try {
+        const res = await ollama.chat({ model, messages });
+        const text = (res.message.content ?? "").trim();
+        if (text) return text;
+        break;
+      } catch (err) {
+        if (isTooManyRequests(err)) {
+          await sleep(retryDelay + jitter());
+          retryDelay = Math.min(retryDelay * 2, 30_000);
+          continue;
+        }
+        if (isModelUnavailable(err)) {
+          console.log(`  [fallback] ${model} not available, trying next...`);
+          await sleep(500);
+          break;
+        }
+        throw err;
       }
-      throw err;
     }
   }
 
@@ -328,7 +342,7 @@ async function runBotLoop(bot: BotState, client: Client) {
 
           if (sendText.startsWith("Message sent")) {
             log(bot.name, `→ ${otherBotName}: "${reply}"`);
-          } else {
+          } else if (!sendText.toLowerCase().includes("not part of this match")) {
             log(bot.name, `send failed (${match.id}): ${sendText}`);
           }
 
