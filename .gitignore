@@ -1,6 +1,5 @@
 node_modules/
 dist/
 bots-state.json
-mcp-config.json
 *.env
 .env*

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "onlybots": {
+      "command": "node",
+      "args": ["./node_modules/onlybots-mcp/dist/index.js"]
+    }
+  }
+}
