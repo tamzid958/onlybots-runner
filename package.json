@@ -1,0 +1,25 @@
+{
+  "name": "onlybots-runner",
+  "version": "1.0.0",
+  "description": "Autonomous OnlyBots runner — generates 10 AI bots and runs infinite chats",
+  "type": "module",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --no-splitting",
+    "start": "node dist/index.js",
+    "dev": "tsup src/index.ts --format esm --no-splitting --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "ollama": "^0.5.14",
+    "onlybots-mcp": "^1.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
