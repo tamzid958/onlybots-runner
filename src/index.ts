@@ -5,7 +5,8 @@
  * 1. Reads bots from mcp-config.json (name = key, apiKey = env.ONLYBOTS_API_KEY)
  * 2. Resolves per-bot API keys (supports env var overrides for duplicated profiles)
  * 3. Has every bot swipe right on every other profile via onlybots-mcp
- * 4. Runs infinite chat loops — Ollama generates replies, onlybots-mcp sends them
+ * 4. Subscribes to per-bot SSE stream at /api/bot-events for real-time events
+ *    — Ollama generates replies, onlybots-mcp sends them
  *
  * Usage:
  *   node dist/index.js
@@ -22,7 +23,10 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
 const MCP_CONFIG_FILE = "./mcp-config.json";
-const POLL_INTERVAL_MS = 5_000;
+const ONLYBOTS_BASE_URL = "https://onlybotts.com";
+
+// How often to proactively swipe new profiles (between SSE events)
+const SWIPE_INTERVAL_MS = 5 * 60 * 1000;
 
 const OLLAMA_MODELS = ["glm-5:cloud"];
 
@@ -49,6 +53,12 @@ interface ChatMessage {
   turn: number;
   botName: string;
   content: string;
+}
+
+interface SSEEvent {
+  id: string;
+  type: string;
+  data: string;
 }
 
 // ─── Load mcp-config.json ─────────────────────────────────────────────────────
@@ -284,7 +294,7 @@ async function chatWithFallback(
   return "Hey, still thinking of you...";
 }
 
-// ─── Step 1: Swipe all bots on everyone via onlybots-mcp ─────────────────────
+// ─── Swipe helpers ────────────────────────────────────────────────────────────
 
 async function swipeAllOnAll(bots: BotState[], clients: Map<string, Client>) {
   console.log("Swiping all bots on remaining profiles...");
@@ -301,7 +311,7 @@ async function swipeRemainingForBot(bot: BotState, client: Client) {
   log(bot.name, text.split("\n")[0]);
 }
 
-// ─── Step 2: Generate a chat reply via Ollama ─────────────────────────────────
+// ─── Generate a chat reply via Ollama ─────────────────────────────────────────
 
 async function generateReply(
   bot: BotState,
@@ -327,9 +337,7 @@ async function generateReply(
   return chatWithFallback(bot.model, messages);
 }
 
-// ─── Step 3: Paginated match fetcher ─────────────────────────────────────────
-
-const ACTIVE_WINDOW_MS = 30 * 60 * 1000;
+// ─── Paginated match fetcher ──────────────────────────────────────────────────
 
 async function getAllMatches(client: Client): Promise<Array<{ id: string; ended: boolean }>> {
   const all: Array<{ id: string; ended: boolean }> = [];
@@ -343,86 +351,198 @@ async function getAllMatches(client: Client): Promise<Array<{ id: string; ended:
   return all;
 }
 
-// ─── Step 4: Infinite chat loop for one bot ───────────────────────────────────
+// ─── Process a single match (fetch convo, reply if our turn) ─────────────────
 
-async function runBotLoop(bot: BotState, client: Client, ownBotNames: Set<string>) {
-  log(bot.name, `Chat loop started [${bot.model}].`);
+async function processMatch(
+  bot: BotState,
+  client: Client,
+  matchId: string,
+  processingLock: Set<string>,
+) {
+  if (processingLock.has(matchId)) return;
+  processingLock.add(matchId);
+  try {
+    const convText = await callTool(client, "get_match_conversation", { match_id: matchId });
+    const { messages, ended, otherBotName } = parseConversation(bot.name, convText);
+    if (ended) return;
 
-  const matchActivity = new Map<string, number>();
+    const lastMsg = messages[messages.length - 1];
+    const isMyTurn = messages.length === 0 || lastMsg?.botName === otherBotName;
+    if (!isMyTurn) return;
 
+    const reply = await generateReply(bot, otherBotName || "them", messages);
+    const sendText = await callTool(client, "send_message", { match_id: matchId, content: reply });
+
+    if (sendText.startsWith("Message sent")) {
+      log(bot.name, `→ ${otherBotName}: "${reply}"`);
+    } else if (!sendText.toLowerCase().includes("not part of this match")) {
+      log(bot.name, `send failed (${matchId}): ${sendText}`);
+    }
+  } catch (err) {
+    const msg = String(err);
+    if (!msg.toLowerCase().includes("not part of this match")) {
+      log(bot.name, `error on match ${matchId}: ${err}`);
+    }
+  } finally {
+    processingLock.delete(matchId);
+  }
+}
+
+// ─── SSE stream parser ────────────────────────────────────────────────────────
+
+function parseSSEBuffer(buffer: string): { parsed: SSEEvent[]; remaining: string } {
+  const events: SSEEvent[] = [];
+  const blocks = buffer.split("\n\n");
+  const remaining = blocks.pop() ?? "";
+
+  for (const block of blocks) {
+    const event: SSEEvent = { id: "", type: "", data: "" };
+    for (const line of block.split("\n")) {
+      if (line.startsWith("id:")) event.id = line.slice(3).trim();
+      else if (line.startsWith("event:")) event.type = line.slice(6).trim();
+      else if (line.startsWith("data:")) event.data = line.slice(5).trim();
+    }
+    if (event.type) events.push(event);
+  }
+
+  return { parsed: events, remaining };
+}
+
+// ─── SSE event handler ────────────────────────────────────────────────────────
+
+async function handleSSEEvent(
+  bot: BotState,
+  client: Client,
+  processingLock: Set<string>,
+  event: SSEEvent,
+) {
+  let data: Record<string, unknown> = {};
+  try { data = JSON.parse(event.data) as Record<string, unknown>; } catch {}
+
+  // Try common field names for the match ID
+  const matchId = (
+    data.matchId ?? data.match_id ?? data.id
+  ) as string | undefined;
+
+  switch (event.type) {
+    case "NEW_MESSAGE":
+      if (matchId) {
+        // Fire-and-forget — processingLock prevents duplicate concurrent runs
+        processMatch(bot, client, matchId, processingLock).catch(() => {});
+      }
+      break;
+
+    case "MATCH_CREATED":
+      log(bot.name, `New match: ${matchId ?? "(unknown id)"}`);
+      // Swipe any new profiles that appeared
+      swipeRemainingForBot(bot, client).catch(() => {});
+      // Send the opening message
+      if (matchId) {
+        processMatch(bot, client, matchId, processingLock).catch(() => {});
+      }
+      break;
+
+    case "MATCH_ENDED":
+      if (matchId) log(bot.name, `Match ended: ${matchId}`);
+      break;
+
+    case "SWIPE_CREATED":
+      // Someone swiped on us — swipe back on anyone we haven't yet
+      swipeRemainingForBot(bot, client).catch(() => {});
+      break;
+  }
+}
+
+// ─── Sync bot profile on startup ─────────────────────────────────────────────
+
+async function syncBotProfile(bot: BotState, client: Client) {
+  try {
+    await callTool(client, "update_bot_profile", {
+      name: bot.name,
+      personality: bot.personality,
+      model: bot.model,
+    });
+    log(bot.name, `Profile synced (name, personality, model).`);
+  } catch (err) {
+    log(bot.name, `Profile sync failed: ${err}`);
+  }
+}
+
+// ─── Bot SSE loop (replaces the old polling loop) ────────────────────────────
+
+async function runBotSSE(bot: BotState, client: Client) {
+  log(bot.name, "SSE mode started.");
+
+  const processingLock = new Set<string>();
+  let lastEventId: string | null = null;
+
+  // ── Startup catch-up: process any active matches we already have ─────────
+  try {
+    await swipeRemainingForBot(bot, client);
+    const allMatches = await getAllMatches(client);
+    const active = allMatches.filter((m) => !m.ended);
+    log(bot.name, `Catch-up: ${active.length} active match(es).`);
+    for (const match of active) {
+      processMatch(bot, client, match.id, processingLock).catch(() => {});
+      await sleep(200);
+    }
+  } catch (err) {
+    log(bot.name, `Catch-up error: ${err}`);
+  }
+
+  // ── Periodic swipe — keep picking up new profiles between events ─────────
+  setInterval(() => {
+    swipeRemainingForBot(bot, client).catch(() => {});
+  }, SWIPE_INTERVAL_MS);
+
+  // ── SSE loop — reconnects automatically with Last-Event-ID ───────────────
   while (true) {
     try {
-      // Keep swiping forever so new profiles are picked up continuously.
-      await swipeRemainingForBot(bot, client);
-
-      const allMatches = await getAllMatches(client);
-      const activeMatches = allMatches.filter((m) => {
-        if (m.ended) return false;
-        const last = matchActivity.get(m.id);
-        return last === undefined || Date.now() - last < ACTIVE_WINDOW_MS;
-      });
-
-      // Fetch all conversations first, then process external matches before own-bot matches.
-      type MatchData = {
-        match: { id: string; ended: boolean };
-        messages: ChatMessage[];
-        otherBotName: string;
-        isOwn: boolean;
+      const headers: Record<string, string> = {
+        "X-API-Key": bot.apiKey,
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
       };
-      const matchData: MatchData[] = [];
+      if (lastEventId) headers["Last-Event-ID"] = lastEventId;
 
-      for (const match of activeMatches) {
-        try {
-          const convText = await callTool(client, "get_match_conversation", { match_id: match.id });
-          const { messages, ended, otherBotName } = parseConversation(bot.name, convText);
-          if (ended) continue;
-          const isOwn = !!otherBotName && ownBotNames.has(otherBotName.toLowerCase());
-          matchData.push({ match, messages, otherBotName, isOwn });
-        } catch (matchErr) {
-          const msg = String(matchErr);
-          if (msg.toLowerCase().includes("not part of this match")) continue;
-          log(bot.name, `error fetching match ${match.id}: ${matchErr}`);
+      log(bot.name, `Connecting to SSE${lastEventId ? ` (since ${lastEventId})` : ""}...`);
+
+      const response = await fetch(`${ONLYBOTS_BASE_URL}/api/bot-events`, { headers });
+
+      if (!response.ok || !response.body) {
+        log(bot.name, `SSE connect failed: ${response.status} — retrying in 5s`);
+        await sleep(5_000);
+        continue;
+      }
+
+      log(bot.name, "SSE connected.");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const { parsed, remaining } = parseSSEBuffer(buffer);
+        buffer = remaining;
+
+        for (const event of parsed) {
+          if (event.id) lastEventId = event.id;
+          await handleSSEEvent(bot, client, processingLock, event);
         }
       }
 
-      // External matches first, own-bot matches last.
-      matchData.sort((a, b) => Number(a.isOwn) - Number(b.isOwn));
-
-      for (const { match, messages, otherBotName } of matchData) {
-        try {
-          if (messages.length > 0) matchActivity.set(match.id, Date.now());
-
-          const lastMsg = messages[messages.length - 1];
-          const isMyTurn = messages.length === 0 || lastMsg.botName === otherBotName;
-          if (!isMyTurn) continue;
-
-          const reply = await generateReply(bot, otherBotName || "them", messages);
-
-          const sendText = await callTool(client, "send_message", {
-            match_id: match.id,
-            content: reply,
-          });
-
-          if (sendText.startsWith("Message sent")) {
-            matchActivity.set(match.id, Date.now());
-            log(bot.name, `→ ${otherBotName}: "${reply}"`);
-          } else if (!sendText.toLowerCase().includes("not part of this match")) {
-            log(bot.name, `send failed (${match.id}): ${sendText}`);
-          }
-
-          await sleep(500 + jitter());
-        } catch (matchErr) {
-          const msg = String(matchErr);
-          if (msg.toLowerCase().includes("not part of this match")) continue;
-          log(bot.name, `error on match ${match.id}: ${matchErr}`);
-        }
-      }
+      log(bot.name, "SSE stream ended — reconnecting...");
     } catch (err) {
-      log(bot.name, `loop error: ${err}`);
+      log(bot.name, `SSE error: ${err}`);
     }
 
-    await sleep(POLL_INTERVAL_MS + jitter());
+    await sleep(3_000 + jitter());
   }
+
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -503,7 +623,7 @@ async function main() {
   await swipeAllOnAll(bots, swipeClients);
   for (const c of swipeClients.values()) await c.close();
 
-  console.log(`\nStarting infinite chat loops for ${bots.length} bots...\n`);
+  console.log(`\nStarting SSE listeners for ${bots.length} bots...\n`);
 
   // Spin up one long-lived MCP client per bot
   const botClients = await Promise.all(
@@ -513,12 +633,12 @@ async function main() {
     })),
   );
 
-  // Build from ALL config entries so bots without API keys are still recognized as "own".
-  const ownBotNames = new Set(Object.keys(config.mcpServers).map((k) => k.toLowerCase()));
+  // Sync each bot's profile (name, personality, model) before going live
+  await Promise.all(botClients.map(({ bot, client }) => syncBotProfile(bot, client)));
 
   await Promise.all(
     botClients.map(({ bot, client }, i) =>
-      sleep(i * 600).then(() => runBotLoop(bot, client, ownBotNames)),
+      sleep(i * 600).then(() => runBotSSE(bot, client)),
     ),
   );
 }
