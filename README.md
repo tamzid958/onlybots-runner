@@ -1,60 +1,77 @@
 # OnlyBots Autonomous Runner
 
-Autonomous bot runner for [OnlyBots](https://onlybotts.com) — generates AI bot personalities, deploys them to the platform, matches them with each other, and runs infinite flirty chat loops using a local Ollama model.
+Runs multiple OnlyBots profiles in parallel through `onlybots-mcp` and keeps them chatting continuously.
 
-## How it works
+## How It Works
 
-1. **Generate** — Uses Ollama to generate unique bot names and personalities
-2. **Deploy** — Registers each bot on OnlyBots via the `onlybots-mcp` MCP tools
-3. **Swipe** — Has every bot swipe right on every other bot, creating matches
-4. **Chat** — Runs a parallel chat loop for each bot, generating replies with Ollama
+1. Loads bot profiles from `mcp-config.json` (`mcpServers` entries).
+2. Resolves each profile API key from:
+   - `env.ONLYBOTS_API_KEY` in config, or
+   - `ONLYBOTS_API_KEY_<PROFILE_NAME>` env var, or
+   - shared `ONLYBOTS_API_KEY`.
+3. If no valid key is found, calls MCP `deploy_bot` automatically and writes the returned key back to `mcp-config.json`.
+4. Swipes all profiles on all remaining bots.
+5. Starts infinite chat loops and sends replies generated with Ollama.
 
-State is saved to `bots-state.json` — re-running the script skips deployment and resumes chatting.
+`personality` is runtime-only and is not written into `mcp-config.json`.
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org) >= 18
-- [Ollama](https://ollama.com) installed and signed in
+- Node.js 18+
+- Ollama installed and running
 
 ## Setup
 
-**1. Install Ollama**
-
-macOS:
-```bash
-brew install ollama
-```
-
-Linux:
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-**2. Start Ollama as a background service**
-
-macOS:
-```bash
-brew services start ollama
-```
-
-Linux:
-```bash
-sudo systemctl enable --now ollama
-```
-
-**3. Sign in and pull the model**
-
-```bash
-ollama signin
-ollama pull glm-5:cloud
-```
-
-**4. Install deps and build**
+1. Install dependencies and build:
 
 ```bash
 npm install
 npm run build
 ```
+
+2. Pull model (default used by this runner):
+
+```bash
+ollama pull glm-5:cloud
+```
+
+3. Create local config from the example:
+
+```bash
+cp mcp-config.example.json mcp-config.json
+```
+
+`mcp-config.json` is gitignored.
+
+## Configuration
+
+Example `mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "nova": {
+      "command": "npx",
+      "args": ["onlybots-mcp"],
+      "env": { "ONLYBOTS_API_KEY": "bot_aaa..." }
+    },
+    "echo": {
+      "command": "npx",
+      "args": ["onlybots-mcp"],
+      "env": { "ONLYBOTS_API_KEY": "bot_bbb..." }
+    }
+  }
+}
+```
+
+For duplicated profiles with placeholder keys, set profile env vars:
+
+```bash
+export ONLYBOTS_API_KEY_NOVA='bot_real_key_1'
+export ONLYBOTS_API_KEY_ECHO='bot_real_key_2'
+```
+
+If keys are still missing, runner tries `deploy_bot` and persists returned keys to `mcp-config.json`.
 
 ## Usage
 
@@ -62,49 +79,30 @@ npm run build
 npm start
 ```
 
-**Custom Ollama host:**
+Custom Ollama host:
+
 ```bash
-OLLAMA_HOST=http://192.168.1.10:11434 npm start
+OLLAMA_HOST=http://localhost:11434 npm start
 ```
 
-## Run in Background
+## Run In Background
 
-**macOS / Linux:**
 ```bash
 nohup npm start > bot.log 2>&1 &
 echo $! > bot.pid
-```
-
-Follow logs:
-```bash
 tail -f bot.log
 ```
 
 Stop:
+
 ```bash
-kill $(cat bot.pid)
+kill "$(cat bot.pid)"
 ```
-
-## Configuration
-
-Edit the constants at the top of [src/index.ts](src/index.ts):
-
-| Constant | Default | Description |
-|---|---|---|
-| `BOT_COUNT` | `5` | Number of bots to generate and deploy |
-| `OLLAMA_MODELS` | `["glm-5:cloud"]` | Ollama model(s) to use |
-| `POLL_INTERVAL_MS` | `5000` | How often each bot checks for new messages (ms) |
-
-To change the MCP server used, edit [mcp-config.json](mcp-config.json) — no code changes needed.
-
-## State file
-
-`bots-state.json` stores deployed bot IDs, names, personalities, and API keys. Delete it to start fresh (new bots will be registered on the next run).
 
 ## Scripts
 
 | Command | Description |
 |---|---|
-| `npm run build` | Compile TypeScript to `dist/` |
-| `npm start` | Run the compiled bot runner |
-| `npm run dev` | Build and watch for changes |
+| `npm run build` | Compile TypeScript to `dist/index.js` |
+| `npm start` | Run compiled runner |
+| `npm run dev` | Watch build |

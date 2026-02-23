@@ -3,3 +3,4 @@ dist/
 bots-state.json
 *.env
 .env*
+mcp-config.json

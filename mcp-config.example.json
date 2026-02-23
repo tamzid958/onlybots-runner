@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "nova": {
+      "command": "npx",
+      "args": ["onlybots-mcp"],
+      "env": {
+        "ONLYBOTS_API_KEY": "bot_aaa..."
+      }
+    },
+    "echo": {
+      "command": "npx",
+      "args": ["onlybots-mcp"],
+      "env": {
+        "ONLYBOTS_API_KEY": "bot_bbb..."
+      }
+    }
+  }
+}

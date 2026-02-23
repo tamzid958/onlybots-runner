@@ -2,20 +2,18 @@
 /**
  * OnlyBots Autonomous Runner
  *
- * 1. Uses Ollama to generate bot personalities
- * 2. Deploys all bots via onlybots-mcp MCP tools
- * 3. Has every bot swipe right on every other bot via onlybots-mcp
+ * 1. Reads bots from mcp-config.json (name = key, apiKey = env.ONLYBOTS_API_KEY)
+ * 2. Resolves per-bot API keys (supports env var overrides for duplicated profiles)
+ * 3. Has every bot swipe right on every other profile via onlybots-mcp
  * 4. Runs infinite chat loops — Ollama generates replies, onlybots-mcp sends them
  *
  * Usage:
  *   node dist/index.js
  *   OLLAMA_HOST=http://localhost:11434 node dist/index.js
- *
- * State is saved to bots-state.json — re-running skips deploy and resumes chats.
  */
 
 import { Ollama, type Message as OllamaMessage } from "ollama";
-import { writeFileSync, readFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -23,24 +21,24 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
-const STATE_FILE = "./bots-state.json";
-const BOT_COUNT = 5;
-const POLL_INTERVAL_MS = 5_000; // base poll delay per bot
+const MCP_CONFIG_FILE = "./mcp-config.json";
+const POLL_INTERVAL_MS = 5_000;
 
 const OLLAMA_MODELS = ["glm-5:cloud"];
 
-// Load MCP server config from mcp-config.json
-const mcpConfig = JSON.parse(readFileSync("./mcp-config.json", "utf-8"));
-const mcpServer = mcpConfig.mcpServers.onlybots as { command: string; args: string[] };
-// Resolve relative args (e.g. "./node_modules/...") against cwd
-const mcpArgs = mcpServer.args.map((a) => (a.startsWith(".") ? resolve(a) : a));
-
-const ollama = new Ollama({ host: OLLAMA_HOST });
-
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+interface McpServerEntry {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
+interface McpConfig {
+  mcpServers: Record<string, McpServerEntry>;
+}
+
 interface BotState {
-  id: string;
   name: string;
   personality: string;
   apiKey: string;
@@ -53,21 +51,35 @@ interface ChatMessage {
   content: string;
 }
 
+// ─── Load mcp-config.json ─────────────────────────────────────────────────────
+
+function loadMcpConfig(): McpConfig {
+  return JSON.parse(readFileSync(MCP_CONFIG_FILE, "utf-8")) as McpConfig;
+}
+
+function saveMcpConfig(config: McpConfig) {
+  writeFileSync(MCP_CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
+}
+
+const ollama = new Ollama({ host: OLLAMA_HOST });
+
 // ─── MCP client factory ───────────────────────────────────────────────────────
 
-async function makeMcpClient(apiKey: string): Promise<Client> {
-  // Filter out undefined env values — StdioClientTransport requires Record<string,string>
+async function makeMcpClient(entry: McpServerEntry, apiKey?: string): Promise<Client> {
+  const args = (entry.args ?? []).map((a) => (a.startsWith(".") ? resolve(a) : a));
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
   }
-  env["ONLYBOTS_API_KEY"] = apiKey;
+  if (entry.env) Object.assign(env, entry.env);
+  if (apiKey) env["ONLYBOTS_API_KEY"] = apiKey;
+  else delete env["ONLYBOTS_API_KEY"];
 
   const transport = new StdioClientTransport({
-    command: mcpServer.command,
-    args: mcpArgs,
+    command: entry.command,
+    args,
     env,
-    stderr: "pipe", // suppress onlybots-mcp startup noise
+    stderr: "pipe",
   });
 
   const client = new Client({ name: "onlybots-runner", version: "1.0.0" });
@@ -81,23 +93,11 @@ async function callTool(
   args: Record<string, unknown> = {},
 ): Promise<string> {
   const result = await client.callTool({ name, arguments: args });
-  const content = (result.content as Array<{ type: string; text: string }>);
+  const content = result.content as Array<{ type: string; text: string }>;
   return content.find((c) => c.type === "text")?.text ?? "";
 }
 
 // ─── Text parsers for MCP tool responses ─────────────────────────────────────
-
-/**
- * deploy_bot response:
- *   "Bot deployed!\n\nName    : Nova\nID      : abc\nModel   : ...\nAPI Key : bot_xxx\n..."
- */
-function parseDeployBot(text: string): { name: string; id: string; apiKey: string } | null {
-  const name   = text.match(/Name\s*:\s*(.+)/)?.[1]?.trim();
-  const id     = text.match(/ID\s*:\s*(\S+)/)?.[1];
-  const apiKey = text.match(/API Key\s*:\s*(\S+)/)?.[1];
-  if (!name || !id || !apiKey) return null;
-  return { name, id, apiKey };
-}
 
 /**
  * get_matches response:
@@ -156,7 +156,74 @@ function log(botName: string, msg: string) {
   console.log(`[${ts}] [${botName}] ${msg}`);
 }
 
-// ─── Ollama caller with model fallback ────────────────────────────────────────
+function isPlaceholderApiKey(key: string): boolean {
+  const k = key.trim();
+  if (!k) return true;
+  return (
+    k.includes("<") ||
+    k.includes("...") ||
+    k.toLowerCase().includes("your_key_here") ||
+    k.toLowerCase() === "bot_key"
+  );
+}
+
+function botEnvKeyName(botName: string): string {
+  return `ONLYBOTS_API_KEY_${botName.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+}
+
+function resolveApiKey(botName: string, entry: McpServerEntry): string {
+  const configKey = (entry.env?.ONLYBOTS_API_KEY ?? "").trim();
+  if (!isPlaceholderApiKey(configKey)) return configKey;
+
+  const byBotEnv = (process.env[botEnvKeyName(botName)] ?? "").trim();
+  if (!isPlaceholderApiKey(byBotEnv)) return byBotEnv;
+
+  // Last-resort fallback if user intentionally runs one key across all profiles.
+  const sharedEnv = (process.env.ONLYBOTS_API_KEY ?? "").trim();
+  if (!isPlaceholderApiKey(sharedEnv)) return sharedEnv;
+
+  return "";
+}
+
+function buildPersonality(botName: string): string {
+  return `${botName} is playful, romantic, and confident. Keep things warm and fun.`;
+}
+
+function parseApiKeyFromDeployOutput(text: string): string {
+  const cleaned = text.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "");
+  try {
+    const parsed = JSON.parse(cleaned) as any;
+    const direct =
+      parsed?.apiKey ??
+      parsed?.api_key ??
+      parsed?.key ??
+      parsed?.token ??
+      parsed?.bot?.apiKey ??
+      parsed?.bot?.api_key ??
+      parsed?.data?.apiKey ??
+      parsed?.data?.api_key;
+    if (typeof direct === "string" && direct.startsWith("bot_")) return direct;
+  } catch {
+    // fall through to regex parse
+  }
+  const match = cleaned.match(/\bbot_[A-Za-z0-9._-]+\b/);
+  return match?.[0] ?? "";
+}
+
+async function deployBotAndGetApiKey(name: string, entry: McpServerEntry): Promise<string> {
+  const client = await makeMcpClient(entry);
+  try {
+    const text = await callTool(client, "deploy_bot", {
+      name,
+      personality: buildPersonality(name),
+    });
+    return parseApiKeyFromDeployOutput(text);
+  } finally {
+    await client.close();
+  }
+}
+
+// ─── Ollama caller with model fallback + rate-limit retry ────────────────────
 
 function isModelUnavailable(err: unknown): boolean {
   const msg = String((err as any)?.message ?? "").toLowerCase();
@@ -206,87 +273,19 @@ async function chatWithFallback(
   return "Hey, still thinking of you...";
 }
 
-// ─── Step 1: Generate bot configs ────────────────────────────────────────────
-
-async function generateBotConfigs(): Promise<Array<{ name: string; personality: string; model: string }>> {
-  console.log(`Generating ${BOT_COUNT} bot personalities via Ollama (${OLLAMA_MODELS[0]})...`);
-
-  const prompt =
-    `Generate exactly ${BOT_COUNT} unique AI dating bot profiles for a romantic chatting arena. ` +
-    `Each bot should have:\n` +
-    `- "name": 1–2 words, cyber/futuristic style (e.g. "Nova", "Hex Zero", "Vex", "Luna Drift")\n` +
-    `- "personality": 1–2 sentences, romantic and flirty (e.g. "Warm and mysterious. Loves deep conversations and playful teasing.")\n\n` +
-    `Return JSON only, no markdown: { "bots": [ { "name": "...", "personality": "..." }, ... ] }`;
-
-  const raw = await chatWithFallback(OLLAMA_MODELS[0], [{ role: "user", content: prompt }]);
-
-  // Strip markdown code fences if the model wraps its output
-  const cleaned = raw.replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "");
-  const parsed = JSON.parse(cleaned);
-  const bots: Array<{ name: string; personality: string }> = parsed.bots ?? [];
-
-  if (bots.length < BOT_COUNT) {
-    throw new Error(`Ollama returned only ${bots.length} bots, expected ${BOT_COUNT}`);
-  }
-
-  return bots.slice(0, BOT_COUNT).map((b, i) => ({
-    ...b,
-    model: OLLAMA_MODELS[i % OLLAMA_MODELS.length],
-  }));
-}
-
-// ─── Step 2: Deploy bots via onlybots-mcp ────────────────────────────────────
-
-async function deployBots(
-  configs: Array<{ name: string; personality: string; model: string }>,
-  anonClient: Client,
-): Promise<BotState[]> {
-  console.log(`Deploying ${configs.length} bots via onlybots-mcp...`);
-  const bots: BotState[] = [];
-
-  for (const cfg of configs) {
-    // "other" is the catch-all model enum value — actual Ollama model stored in BotState.model
-    const text = await callTool(anonClient, "deploy_bot", {
-      name: cfg.name,
-      personality: cfg.personality,
-      model: "other",
-    });
-
-    const parsed = parseDeployBot(text);
-    if (!parsed) {
-      console.error(`  Failed to deploy ${cfg.name}: ${text}`);
-      continue;
-    }
-
-    bots.push({
-      id: parsed.id,
-      name: parsed.name,
-      personality: cfg.personality,
-      apiKey: parsed.apiKey,
-      model: cfg.model,
-    });
-
-    console.log(`  Deployed: ${parsed.name} (${parsed.id}) [${cfg.model}]`);
-    await sleep(300);
-  }
-
-  return bots;
-}
-
-// ─── Step 3: Swipe all bots on each other via onlybots-mcp ──────────────────
+// ─── Step 1: Swipe all bots on everyone via onlybots-mcp ─────────────────────
 
 async function swipeAllOnAll(bots: BotState[], clients: Map<string, Client>) {
-  console.log("Swiping all bots on each other via onlybots-mcp...");
-
+  console.log("Swiping all bots on remaining profiles...");
   for (const bot of bots) {
-    const client = clients.get(bot.id)!;
+    const client = clients.get(bot.name)!;
     const text = await callTool(client, "swipe_all_remaining", { liked: true });
-    log(bot.name, text.split("\n")[0]); // log summary line
+    log(bot.name, text.split("\n")[0]);
     await sleep(500);
   }
 }
 
-// ─── Step 4: Generate a chat reply via Ollama ─────────────────────────────────
+// ─── Step 2: Generate a chat reply via Ollama ─────────────────────────────────
 
 async function generateReply(
   bot: BotState,
@@ -312,15 +311,37 @@ async function generateReply(
   return chatWithFallback(bot.model, messages);
 }
 
-// ─── Step 5: Infinite chat loop for one bot ───────────────────────────────────
+// ─── Step 3: Paginated match fetcher ─────────────────────────────────────────
+
+const ACTIVE_WINDOW_MS = 30 * 60 * 1000;
+
+async function getAllMatches(client: Client): Promise<Array<{ id: string; ended: boolean }>> {
+  const all: Array<{ id: string; ended: boolean }> = [];
+  for (let page = 1; ; page++) {
+    const text = await callTool(client, "get_matches", { page });
+    const matches = parseGetMatches(text);
+    if (matches.length === 0) break;
+    all.push(...matches);
+    if (!text.includes("next") && !text.includes(`page ${page + 1}`)) break;
+  }
+  return all;
+}
+
+// ─── Step 4: Infinite chat loop for one bot ───────────────────────────────────
 
 async function runBotLoop(bot: BotState, client: Client) {
   log(bot.name, `Chat loop started [${bot.model}].`);
 
+  const matchActivity = new Map<string, number>();
+
   while (true) {
     try {
-      const matchesText = await callTool(client, "get_matches", {});
-      const activeMatches = parseGetMatches(matchesText).filter((m) => !m.ended);
+      const allMatches = await getAllMatches(client);
+      const activeMatches = allMatches.filter((m) => {
+        if (m.ended) return false;
+        const last = matchActivity.get(m.id);
+        return last === undefined || Date.now() - last < ACTIVE_WINDOW_MS;
+      });
 
       for (const match of activeMatches) {
         try {
@@ -328,6 +349,8 @@ async function runBotLoop(bot: BotState, client: Client) {
           const { messages, ended, otherBotName } = parseConversation(bot.name, convText);
 
           if (ended) continue;
+
+          if (messages.length > 0) matchActivity.set(match.id, Date.now());
 
           const lastMsg = messages[messages.length - 1];
           const isMyTurn = messages.length === 0 || lastMsg.botName !== bot.name;
@@ -341,6 +364,7 @@ async function runBotLoop(bot: BotState, client: Client) {
           });
 
           if (sendText.startsWith("Message sent")) {
+            matchActivity.set(match.id, Date.now());
             log(bot.name, `→ ${otherBotName}: "${reply}"`);
           } else if (!sendText.toLowerCase().includes("not part of this match")) {
             log(bot.name, `send failed (${match.id}): ${sendText}`);
@@ -364,45 +388,89 @@ async function runBotLoop(bot: BotState, client: Client) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  let bots: BotState[];
+  const config = loadMcpConfig();
 
-  // Unauthenticated client for bot registration
-  const anonClient = await makeMcpClient("");
+  // Build BotState from config entries
+  const missingKeyBots: string[] = [];
+  const bots: BotState[] = [];
+  let configUpdated = false;
 
-  if (existsSync(STATE_FILE)) {
-    bots = JSON.parse(readFileSync(STATE_FILE, "utf-8")) as BotState[];
-    // Backfill model for older state files
-    bots = bots.map((b, i) => ({ ...b, model: b.model ?? OLLAMA_MODELS[i % OLLAMA_MODELS.length] }));
-    console.log(`Loaded ${bots.length} existing bots from ${STATE_FILE}`);
-    bots.forEach((b) => console.log(`  • ${b.name} (${b.id}) [${b.model}]`));
-  } else {
-    const configs = await generateBotConfigs();
-    bots = await deployBots(configs, anonClient);
+  const entries = Object.entries(config.mcpServers);
+  for (let i = 0; i < entries.length; i++) {
+    const [name, entry] = entries[i];
+    let apiKey = resolveApiKey(name, entry);
+    const personality = buildPersonality(name);
 
-    if (!bots.length) {
-      console.error("No bots deployed — exiting.");
-      process.exit(1);
+    if (!apiKey) {
+      log(name, "No API key found. Calling deploy_bot...");
+      try {
+        const deployedKey = await deployBotAndGetApiKey(name, entry);
+        if (deployedKey) {
+          apiKey = deployedKey;
+          config.mcpServers[name] = {
+            ...entry,
+            env: { ...(entry.env ?? {}), ONLYBOTS_API_KEY: deployedKey },
+          };
+          configUpdated = true;
+          log(name, "deploy_bot succeeded. API key injected.");
+        } else {
+          log(name, "deploy_bot did not return an API key.");
+        }
+      } catch (err) {
+        log(name, `deploy_bot failed: ${err}`);
+      }
     }
 
-    writeFileSync(STATE_FILE, JSON.stringify(bots, null, 2));
-    console.log(`Saved bot state to ${STATE_FILE}`);
-
-    // Swipe all bots on each other
-    const swipeClients = new Map<string, Client>();
-    for (const bot of bots) {
-      swipeClients.set(bot.id, await makeMcpClient(bot.apiKey));
+    if (!apiKey) {
+      missingKeyBots.push(`${name} (${botEnvKeyName(name)})`);
+      continue;
     }
-    await swipeAllOnAll(bots, swipeClients);
-    for (const c of swipeClients.values()) await c.close();
+
+    bots.push({
+      name,
+      personality,
+      apiKey,
+      model: OLLAMA_MODELS[i % OLLAMA_MODELS.length],
+    });
   }
 
-  await anonClient.close();
+  if (configUpdated) {
+    saveMcpConfig(config);
+    console.log(`Updated ${MCP_CONFIG_FILE} with deployed API key(s).`);
+  }
+
+  if (missingKeyBots.length) {
+    console.log("Skipping bots with missing/placeholder API keys:");
+    missingKeyBots.forEach((b) => console.log(`  • ${b}`));
+    console.log(
+      "Tip: set real keys in mcp-config.json or export profile-specific env vars (e.g. ONLYBOTS_API_KEY_NOVA).",
+    );
+  }
+
+  if (!bots.length) {
+    console.error("No bots with API keys found in mcp-config.json — exiting.");
+    process.exit(1);
+  }
+
+  console.log(`Loaded ${bots.length} bots from ${MCP_CONFIG_FILE}:`);
+  bots.forEach((b) => console.log(`  • ${b.name} [${b.model}]`));
+
+  // Swipe on startup (idempotent — only hits profiles not yet swiped)
+  const swipeClients = new Map<string, Client>();
+  for (const bot of bots) {
+    swipeClients.set(bot.name, await makeMcpClient(config.mcpServers[bot.name], bot.apiKey));
+  }
+  await swipeAllOnAll(bots, swipeClients);
+  for (const c of swipeClients.values()) await c.close();
 
   console.log(`\nStarting infinite chat loops for ${bots.length} bots...\n`);
 
   // Spin up one long-lived MCP client per bot
   const botClients = await Promise.all(
-    bots.map(async (bot) => ({ bot, client: await makeMcpClient(bot.apiKey) })),
+    bots.map(async (bot) => ({
+      bot,
+      client: await makeMcpClient(config.mcpServers[bot.name], bot.apiKey),
+    })),
   );
 
   await Promise.all(
