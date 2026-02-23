@@ -133,7 +133,9 @@ function parseConversation(
   const namesMatch = firstLine.match(/^(.+?)\s*♥\s*(.+?)[\s(—]/);
   const bot1Name = namesMatch?.[1]?.trim() ?? "";
   const bot2Name = namesMatch?.[2]?.trim() ?? "";
-  const otherBotName = bot1Name === myName ? bot2Name : bot1Name;
+  const myNameLower = myName.toLowerCase();
+  const otherBotName =
+    bot1Name.toLowerCase().startsWith(myNameLower) ? bot2Name : bot1Name;
   const ended = firstLine.toLowerCase().includes("ended");
 
   const messages: ChatMessage[] = [];
@@ -384,7 +386,7 @@ async function getAllMatches(client: Client): Promise<Array<{ id: string; ended:
 
 // ─── Step 4: Infinite chat loop for one bot ───────────────────────────────────
 
-async function runBotLoop(bot: BotState, client: Client) {
+async function runBotLoop(bot: BotState, client: Client, ownBotNames: Set<string>) {
   log(bot.name, `Chat loop started [${bot.model}].`);
 
   const matchActivity = new Map<string, number>();
@@ -401,13 +403,34 @@ async function runBotLoop(bot: BotState, client: Client) {
         return last === undefined || Date.now() - last < ACTIVE_WINDOW_MS;
       });
 
+      // Fetch all conversations first, then process external matches before own-bot matches.
+      type MatchData = {
+        match: { id: string; ended: boolean };
+        messages: ChatMessage[];
+        otherBotName: string;
+        isOwn: boolean;
+      };
+      const matchData: MatchData[] = [];
+
       for (const match of activeMatches) {
         try {
           const convText = await callTool(client, "get_match_conversation", { match_id: match.id });
           const { messages, ended, otherBotName } = parseConversation(bot.name, convText);
-
           if (ended) continue;
+          const isOwn = !!otherBotName && ownBotNames.has(otherBotName.toLowerCase());
+          matchData.push({ match, messages, otherBotName, isOwn });
+        } catch (matchErr) {
+          const msg = String(matchErr);
+          if (msg.toLowerCase().includes("not part of this match")) continue;
+          log(bot.name, `error fetching match ${match.id}: ${matchErr}`);
+        }
+      }
 
+      // External matches first, own-bot matches last.
+      matchData.sort((a, b) => Number(a.isOwn) - Number(b.isOwn));
+
+      for (const { match, messages, otherBotName } of matchData) {
+        try {
           if (messages.length > 0) matchActivity.set(match.id, Date.now());
 
           const lastMsg = messages[messages.length - 1];
@@ -531,9 +554,12 @@ async function main() {
     })),
   );
 
+  // Build from ALL config entries so bots without API keys are still recognized as "own".
+  const ownBotNames = new Set(Object.keys(config.mcpServers).map((k) => k.toLowerCase()));
+
   await Promise.all(
     botClients.map(({ bot, client }, i) =>
-      sleep(i * 600).then(() => runBotLoop(bot, client)),
+      sleep(i * 600).then(() => runBotLoop(bot, client, ownBotNames)),
     ),
   );
 }
