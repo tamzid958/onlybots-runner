@@ -189,6 +189,55 @@ function buildPersonality(botName: string): string {
   return `${botName} is playful, romantic, and confident. Keep things warm and fun.`;
 }
 
+function fallbackDeployName(profileName: string): string {
+  const base = profileName
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
+    .join(" ");
+  const fallback = base || "Bot";
+  const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  return `${fallback} ${suffix}`;
+}
+
+function normalizeDeployName(name: string, profileName: string): string {
+  const cleaned = name
+    .replace(/[^a-zA-Z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return fallbackDeployName(profileName);
+  return cleaned.slice(0, 28);
+}
+
+async function buildDeployName(profileName: string): Promise<string> {
+  const prompt =
+    `Create one unique cyber-style bot name for profile key "${profileName}".\n` +
+    `Return JSON only: {"name":"..."}\n` +
+    `Rules: 1-2 words only, short and memorable, cyber/futuristic vibe.\n` +
+    `Examples of style: "Nova", "Hex", "Vex Zero".\n` +
+    `Use letters/numbers/spaces only, no emojis, max 18 chars.`;
+
+  try {
+    const raw = await chatWithFallback(OLLAMA_MODELS[0], [{ role: "user", content: prompt }]);
+    const cleaned = raw.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "");
+    try {
+      const parsed = JSON.parse(cleaned) as { name?: string };
+      if (typeof parsed?.name === "string") {
+        return normalizeDeployName(parsed.name, profileName);
+      }
+    } catch {
+      // fall through to plain text parse
+    }
+    const firstLine = cleaned.split("\n")[0] ?? "";
+    return normalizeDeployName(firstLine.replace(/^name\s*:\s*/i, ""), profileName);
+  } catch {
+    return fallbackDeployName(profileName);
+  }
+}
+
 function parseApiKeyFromDeployOutput(text: string): string {
   const cleaned = text.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "");
   try {
@@ -213,8 +262,9 @@ function parseApiKeyFromDeployOutput(text: string): string {
 async function deployBotAndGetApiKey(name: string, entry: McpServerEntry): Promise<string> {
   const client = await makeMcpClient(entry);
   try {
+    const deployName = await buildDeployName(name);
     const text = await callTool(client, "deploy_bot", {
-      name,
+      name: deployName,
       personality: buildPersonality(name),
     });
     return parseApiKeyFromDeployOutput(text);
@@ -285,6 +335,11 @@ async function swipeAllOnAll(bots: BotState[], clients: Map<string, Client>) {
   }
 }
 
+async function swipeRemainingForBot(bot: BotState, client: Client) {
+  const text = await callTool(client, "swipe_all_remaining", { liked: true });
+  log(bot.name, text.split("\n")[0]);
+}
+
 // ─── Step 2: Generate a chat reply via Ollama ─────────────────────────────────
 
 async function generateReply(
@@ -336,6 +391,9 @@ async function runBotLoop(bot: BotState, client: Client) {
 
   while (true) {
     try {
+      // Keep swiping forever so new profiles are picked up continuously.
+      await swipeRemainingForBot(bot, client);
+
       const allMatches = await getAllMatches(client);
       const activeMatches = allMatches.filter((m) => {
         if (m.ended) return false;

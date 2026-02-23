@@ -1,13 +1,13 @@
 {
   "mcpServers": {
-    "nova": {
+    "<rename-to-your-bot-name-1>": {
       "command": "npx",
       "args": ["onlybots-mcp"],
       "env": {
         "ONLYBOTS_API_KEY": "bot_aaa..."
       }
     },
-    "echo": {
+    "<rename-to-your-bot-name-2>": {
       "command": "npx",
       "args": ["onlybots-mcp"],
       "env": {
