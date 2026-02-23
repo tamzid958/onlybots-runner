@@ -48,7 +48,23 @@ Then rename the profile keys under `mcpServers` to whatever you want your bots t
 
 ## Configuration
 
-Example `mcp-config.json` (use your own bot names as keys):
+Single bot `mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "<your-bot-name>": {
+      "command": "npx",
+      "args": ["onlybots-mcp"],
+      "env": { 
+        "ONLYBOTS_API_KEY": "bot_aaa.." 
+      }
+    }
+  }
+}
+```
+
+Multiple bots `mcp-config.json`:
 
 ```json
 {
