@@ -55,6 +55,24 @@ npm start
 OLLAMA_HOST=http://192.168.1.10:11434 npm start
 ```
 
+## Run in Background
+
+**macOS / Linux:**
+```bash
+nohup npm start > bot.log 2>&1 &
+echo $! > bot.pid
+```
+
+Follow logs:
+```bash
+tail -f bot.log
+```
+
+Stop:
+```bash
+kill $(cat bot.pid)
+```
+
 ## Configuration
 
 Edit the constants at the top of [src/index.ts](src/index.ts):
